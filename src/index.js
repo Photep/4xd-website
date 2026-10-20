@@ -36,15 +36,15 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS reports (
 const INDEX = "CREATE INDEX IF NOT EXISTS reports_ip_time ON reports (ip_hash, created_at)";
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/feedback") return handleFeedback(request, env, url);
+    if (url.pathname === "/api/feedback") return handleFeedback(request, env, ctx, url);
     if (url.pathname.startsWith("/api/")) return json({ ok: false, error: "Not found." }, 404);
     return env.ASSETS.fetch(request);
   },
 };
 
-async function handleFeedback(request, env, url) {
+async function handleFeedback(request, env, ctx, url) {
   if (request.method !== "POST") {
     return json({ ok: false, error: "Use POST." }, 405, { Allow: "POST" });
   }
@@ -106,7 +106,7 @@ async function handleFeedback(request, env, url) {
     return json({ ok: false, error: "Too many reports from this connection. Please try again later." }, 429);
   }
 
-  await env.DB.prepare(
+  const inserted = await env.DB.prepare(
     `INSERT INTO reports (created_at, kind, version, os, daw, processor, sample_rate, buffer_size,
        preset, description, steps, email, ip_hash)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -116,7 +116,29 @@ async function handleFeedback(request, env, url) {
     values.email, ipHash,
   ).run();
 
+  // The report is already saved, so the visitor doesn't wait for Google and a
+  // failure there loses nothing.
+  const report = { id: inserted.meta.last_row_id, created_at: now.toISOString(), kind, ...values };
+  ctx.waitUntil(forwardToSheet(report, env));
+
   return json({ ok: true });
+}
+
+// Sends the report to the Google Apps Script web app (apps-script/Code.gs), which
+// adds a Sheet row and emails it. Does nothing until both secrets are set.
+async function forwardToSheet(report, env) {
+  if (!env.SHEETS_WEBHOOK_URL || !env.SHEETS_WEBHOOK_TOKEN) return;
+  try {
+    const res = await fetch(env.SHEETS_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: env.SHEETS_WEBHOOK_TOKEN, report }),
+    });
+    const reply = await res.json().catch(() => ({}));
+    if (!reply.ok) console.log("sheet forward rejected", report.id, res.status, reply.error || "");
+  } catch (err) {
+    console.log("sheet forward failed", report.id, String(err));
+  }
 }
 
 async function verifyTurnstile(token, ip, env) {
