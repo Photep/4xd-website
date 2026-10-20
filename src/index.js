@@ -71,8 +71,10 @@ async function handleFeedback(request, env, url) {
   const ip = request.headers.get("CF-Connecting-IP") || "";
   const token = String(form.get("cf-turnstile-response") || "");
   if (!token) return json({ ok: false, error: "Please complete the verification check." }, 400);
-  if (!(await verifyTurnstile(token, ip, env))) {
-    return json({ ok: false, error: "Verification failed. Please try again." }, 403);
+  const check = await verifyTurnstile(token, ip, env);
+  if (!check.ok) {
+    console.log("turnstile rejected", check.code);
+    return json({ ok: false, error: "Verification failed. Please try again.", code: check.code }, 403);
   }
 
   const kind = String(form.get("kind") || "");
@@ -118,7 +120,7 @@ async function handleFeedback(request, env, url) {
 }
 
 async function verifyTurnstile(token, ip, env) {
-  if (!env.TURNSTILE_SECRET_KEY) return false;
+  if (!env.TURNSTILE_SECRET_KEY) return { ok: false, code: "missing-secret" };
   const body = new FormData();
   body.append("secret", env.TURNSTILE_SECRET_KEY);
   body.append("response", token);
@@ -129,9 +131,10 @@ async function verifyTurnstile(token, ip, env) {
       body,
     });
     const outcome = await res.json();
-    return outcome.success === true;
+    if (outcome.success === true) return { ok: true };
+    return { ok: false, code: (outcome["error-codes"] || []).join(",") || "rejected" };
   } catch {
-    return false;
+    return { ok: false, code: "siteverify-unreachable" };
   }
 }
 

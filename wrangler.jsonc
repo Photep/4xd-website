@@ -10,5 +10,6 @@
     "run_worker_first": ["/api/*"]
   },
   // No database_id: Wrangler creates the database on first deploy and keeps it linked.
-  "d1_databases": [{ "binding": "DB", "database_name": "4xd-feedback" }]
+  "d1_databases": [{ "binding": "DB", "database_name": "4xd-feedback" }],
+  "observability": { "enabled": true }
 }
