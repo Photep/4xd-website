@@ -32,3 +32,19 @@ After a report is saved, the Worker also posts it to a Google Apps Script web ap
 - `SHEETS_WEBHOOK_TOKEN`: the token printed by `setup()` in the script
 
 Set the script property `NOTIFY_TO` to choose where report emails go (default: the script owner's address). If forwarding fails, the report is still in D1; failures show in the Worker's logs.
+
+## Download counts
+
+Requests for `/downloads/*` run the Worker, which serves the file from `public/` as before and records the download in the D1 table `downloads` (one row per day, file and visitor, with a `hits` counter). Visitors are identified only by a hash of the IP address with a salt that changes daily. HEAD requests, mid-file range requests (resumes, download managers), known bots and missing files aren't counted.
+
+Query in Cloudflare → Storage & databases → D1 → `4xd-feedback` → Console:
+
+```sql
+-- Totals per installer
+SELECT file, COUNT(*) AS unique_downloads, SUM(hits) AS total FROM downloads GROUP BY file ORDER BY file;
+
+-- Per day
+SELECT day, file, COUNT(*) AS unique_downloads, SUM(hits) AS total FROM downloads GROUP BY day, file ORDER BY day DESC, file;
+```
+
+"Unique" counts each visitor once per file per day.

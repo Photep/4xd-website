@@ -40,9 +40,57 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/api/feedback") return handleFeedback(request, env, ctx, url);
     if (url.pathname.startsWith("/api/")) return json({ ok: false, error: "Not found." }, 404);
+    if (url.pathname.startsWith("/downloads/")) return handleDownload(request, env, ctx, url);
     return env.ASSETS.fetch(request);
   },
 };
+
+// Installer downloads are served from public/ as before; the Worker only counts them.
+// One row per day, file and visitor (IP hashed with a salt that changes daily), so
+// COUNT(*) gives unique downloads and SUM(hits) gives every counted request.
+const DOWNLOADS_SCHEMA = `CREATE TABLE IF NOT EXISTS downloads (
+  day TEXT NOT NULL,
+  file TEXT NOT NULL,
+  visitor TEXT NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (day, file, visitor)
+)`;
+const BOT_AGENTS = /bot|crawl|spider|slurp|preview|facebookexternalhit|embedly|whatsapp|vkshare|skypeuripreview/i;
+
+async function handleDownload(request, env, ctx, url) {
+  const response = await env.ASSETS.fetch(request);
+  if (isCountable(request, response)) {
+    ctx.waitUntil(recordDownload(request, env, decodeURIComponent(url.pathname.slice("/downloads/".length))));
+  }
+  return response;
+}
+
+function isCountable(request, response) {
+  if (request.method !== "GET") return false;
+  if (BOT_AGENTS.test(request.headers.get("User-Agent") || "")) return false;
+  // Resumed downloads and download managers fetch later byte ranges separately;
+  // only the request that starts at the beginning of the file counts.
+  const range = request.headers.get("Range");
+  if (range && !/^bytes=0-/.test(range.trim())) return false;
+  return response.status === 200 || response.status === 206;
+}
+
+async function recordDownload(request, env, file) {
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    const ip = request.headers.get("CF-Connecting-IP") || "";
+    const visitor = (await sha256(`${day}|${ip}|${env.TURNSTILE_SECRET_KEY}`)).slice(0, 32);
+    await env.DB.batch([
+      env.DB.prepare(DOWNLOADS_SCHEMA),
+      env.DB.prepare(
+        `INSERT INTO downloads (day, file, visitor) VALUES (?, ?, ?)
+         ON CONFLICT (day, file, visitor) DO UPDATE SET hits = hits + 1`,
+      ).bind(day, file, visitor),
+    ]);
+  } catch (err) {
+    console.log("download count failed", file, String(err));
+  }
+}
 
 async function handleFeedback(request, env, ctx, url) {
   if (request.method !== "POST") {
