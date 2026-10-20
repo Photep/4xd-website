@@ -1,0 +1,6 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "wispy-bush-48f0",
+  "compatibility_date": "2026-10-20",
+  "assets": { "directory": "./public" }
+}
