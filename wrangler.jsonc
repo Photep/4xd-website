@@ -2,5 +2,13 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "4xd-website",
   "compatibility_date": "2026-10-20",
-  "assets": { "directory": "./public" }
+  "main": "src/index.js",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Only the feedback API runs the Worker; every other request is served straight from public/.
+    "run_worker_first": ["/api/*"]
+  },
+  // No database_id: Wrangler creates the database on first deploy and keeps it linked.
+  "d1_databases": [{ "binding": "DB", "database_name": "4xd-feedback" }]
 }
