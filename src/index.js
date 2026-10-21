@@ -14,7 +14,10 @@ const TEXT_FIELDS = {
   email: { max: 254 },
 };
 const KINDS = new Set(["bug", "feedback"]);
-const MAX_BODY_BYTES = 32 * 1024;
+// Room for every field at its limit in any script (up to 3 UTF-8 bytes per
+// character) plus the Turnstile token and multipart overhead.
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_TOKEN_LENGTH = 2048; // Turnstile's documented maximum
 const PER_IP_PER_HOUR = 5;
 
 const SCHEMA = `CREATE TABLE IF NOT EXISTS reports (
@@ -102,8 +105,12 @@ async function handleFeedback(request, env, ctx, url) {
     return json({ ok: false, error: "Cross-site submissions are not accepted." }, 403);
   }
 
-  const length = Number(request.headers.get("Content-Length") || 0);
-  if (length > MAX_BODY_BYTES) return json({ ok: false, error: "The report is too large." }, 413);
+  // Browsers always send Content-Length for a form; without it the size cap
+  // could not be applied before the body is read.
+  const lengthHeader = request.headers.get("Content-Length");
+  if (lengthHeader === null) return json({ ok: false, error: "The report size is missing." }, 411);
+  const length = Number(lengthHeader);
+  if (!Number.isFinite(length) || length > MAX_BODY_BYTES) return json({ ok: false, error: "The report is too large." }, 413);
 
   let form;
   try {
@@ -118,6 +125,7 @@ async function handleFeedback(request, env, ctx, url) {
 
   const ip = request.headers.get("CF-Connecting-IP") || "";
   const token = String(form.get("cf-turnstile-response") || "");
+  if (token.length > MAX_TOKEN_LENGTH) return json({ ok: false, error: "Verification failed. Please try again." }, 400);
   if (!token) return json({ ok: false, error: "Please complete the verification check." }, 400);
   const check = await verifyTurnstile(token, ip, env);
   if (!check.ok) {
@@ -130,7 +138,9 @@ async function handleFeedback(request, env, ctx, url) {
 
   const values = {};
   for (const [name, rule] of Object.entries(TEXT_FIELDS)) {
-    const value = String(form.get(name) || "").trim();
+    // Form submission turns each line break into CRLF, but the browser's
+    // maxlength counted it as one character; count it the same way here.
+    const value = String(form.get(name) || "").replace(/\r\n?/g, "\n").trim();
     if (value.length > rule.max) {
       return json({ ok: false, error: `Please shorten ${label(name)}.` }, 400);
     }
