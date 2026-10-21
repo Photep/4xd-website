@@ -48,3 +48,9 @@ SELECT day, file, COUNT(*) AS unique_downloads, SUM(hits) AS total FROM download
 ```
 
 "Unique" counts each visitor once per file per day.
+
+### Attachments
+
+The form accepts up to 3 files (4 MB each, 8 MB total): PNG, JPEG or WebP screenshots, or text logs (`.txt`, `.log`, `.ips`, `.crash`, `.json`). The Worker checks file contents (image signatures; text must be valid UTF-8 without NUL bytes), records names and sizes in the D1 table `report_attachments`, and sends the files to the Apps Script, which files them in the feedback account's Drive as `4xD feedback attachments / YYYY-MM / #id · kind · date /`. Email and the Sheet link to that folder rather than attaching the files. A daily trigger (`purgeOldAttachments`) permanently deletes report folders after 90 days. If Drive can't save the files, the report is still stored and the visitor is asked to email them.
+
+After updating `apps-script/Code.gs` in the script editor: save, run `setup()` once to approve the Drive permission and create the folder and daily trigger, then **Deploy → Manage deployments → edit → Version: New version → Deploy**, which keeps the web app URL the Worker already uses.

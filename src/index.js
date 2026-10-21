@@ -14,9 +14,14 @@ const TEXT_FIELDS = {
   email: { max: 254 },
 };
 const KINDS = new Set(["bug", "feedback"]);
-// Room for every field at its limit in any script (up to 3 UTF-8 bytes per
-// character) plus the Turnstile token and multipart overhead.
-const MAX_BODY_BYTES = 64 * 1024;
+// Optional screenshots and text logs. Contents are checked (image signatures;
+// text must be valid UTF-8 without NUL bytes) instead of trusting names or types.
+const ATTACHMENTS = { maxFiles: 3, maxFileBytes: 4 * 1024 * 1024, maxTotalBytes: 8 * 1024 * 1024 };
+const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", webp: "image/webp" };
+const TEXT_EXTENSIONS = new Set(["txt", "log", "ips", "crash", "json"]);
+// Room for every text field at its limit in any script (up to 3 UTF-8 bytes per
+// character), the Turnstile token, multipart overhead and the attachments.
+const MAX_BODY_BYTES = 64 * 1024 + ATTACHMENTS.maxTotalBytes;
 const MAX_TOKEN_LENGTH = 2048; // Turnstile's documented maximum
 const PER_IP_PER_HOUR = 5;
 
@@ -37,6 +42,15 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS reports (
   ip_hash TEXT NOT NULL
 )`;
 const INDEX = "CREATE INDEX IF NOT EXISTS reports_ip_time ON reports (ip_hash, created_at)";
+// Names and sizes only; the files themselves are stored in Google Drive by the Apps Script.
+const ATTACHMENTS_SCHEMA = `CREATE TABLE IF NOT EXISTS report_attachments (
+  report_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  saved INTEGER NOT NULL DEFAULT 0
+)`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -110,7 +124,7 @@ async function handleFeedback(request, env, ctx, url) {
   const lengthHeader = request.headers.get("Content-Length");
   if (lengthHeader === null) return json({ ok: false, error: "The report size is missing." }, 411);
   const length = Number(lengthHeader);
-  if (!Number.isFinite(length) || length > MAX_BODY_BYTES) return json({ ok: false, error: "The report is too large." }, 413);
+  if (!Number.isFinite(length) || length > MAX_BODY_BYTES) return json({ ok: false, error: "The report is too large. Attachments can total up to 8 MB." }, 413);
 
   let form;
   try {
@@ -152,11 +166,21 @@ async function handleFeedback(request, env, ctx, url) {
     return json({ ok: false, error: "Please check the email address." }, 400);
   }
 
+  const files = form.getAll("attachments").filter((f) => typeof f === "object" && (f.name || f.size));
+  if (files.length > ATTACHMENTS.maxFiles) return json({ ok: false, error: `Attach up to ${ATTACHMENTS.maxFiles} files.` }, 400);
+  if (files.reduce((sum, f) => sum + f.size, 0) > ATTACHMENTS.maxTotalBytes) return json({ ok: false, error: "The attachments are larger than 8 MB in total." }, 400);
+  const attachments = [];
+  for (const file of files) {
+    const checked = await readAttachment(file);
+    if (checked.error) return json({ ok: false, error: checked.error }, 400);
+    attachments.push(checked.file);
+  }
+
   const ipHash = await sha256(`${ip}|${env.TURNSTILE_SECRET_KEY}`);
   const now = new Date();
   const hourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
 
-  await env.DB.batch([env.DB.prepare(SCHEMA), env.DB.prepare(INDEX)]);
+  await env.DB.batch([env.DB.prepare(SCHEMA), env.DB.prepare(INDEX), env.DB.prepare(ATTACHMENTS_SCHEMA)]);
   const recent = await env.DB.prepare(
     "SELECT COUNT(*) AS n FROM reports WHERE ip_hash = ? AND created_at > ?",
   ).bind(ipHash, hourAgo).first("n");
@@ -174,28 +198,76 @@ async function handleFeedback(request, env, ctx, url) {
     values.email, ipHash,
   ).run();
 
-  // The report is already saved, so the visitor doesn't wait for Google and a
-  // failure there loses nothing.
   const report = { id: inserted.meta.last_row_id, created_at: now.toISOString(), kind, ...values };
-  ctx.waitUntil(forwardToSheet(report, env));
-
-  return json({ ok: true });
+  if (attachments.length === 0) {
+    // The report is already saved, so the visitor doesn't wait for Google and a
+    // failure there loses nothing.
+    ctx.waitUntil(forwardToSheet(report, env));
+    return json({ ok: true, report: report.id });
+  }
+  // Files exist only once Drive has them, so wait and tell the visitor if that failed.
+  await env.DB.batch(attachments.map((a) => env.DB.prepare(
+    "INSERT INTO report_attachments (report_id, name, type, size, sha256) VALUES (?, ?, ?, ?, ?)",
+  ).bind(report.id, a.name, a.type, a.size, a.sha256)));
+  const reply = await forwardToSheet(report, env, attachments);
+  const saved = reply.ok && reply.attachments === attachments.length;
+  if (saved) await env.DB.prepare("UPDATE report_attachments SET saved = 1 WHERE report_id = ?").bind(report.id).run();
+  else console.log("attachments not saved", report.id, reply.error || "");
+  return json({ ok: true, report: report.id, attachments: attachments.length, attachmentsSaved: saved });
 }
 
-// Sends the report to the Google Apps Script web app (apps-script/Code.gs), which
-// adds a Sheet row and emails it. Does nothing until both secrets are set.
-async function forwardToSheet(report, env) {
-  if (!env.SHEETS_WEBHOOK_URL || !env.SHEETS_WEBHOOK_TOKEN) return;
+// Returns { file } for a supported screenshot or text log, or { error } to show the visitor.
+async function readAttachment(file) {
+  const original = String(file.name || "file");
+  const shown = original.length > 40 ? original.slice(0, 37) + "…" : original;
+  const ext = (original.match(/\.([A-Za-z0-9]+)$/) || [])[1]?.toLowerCase() || "";
+  if (file.size === 0) return { error: `“${shown}” is empty.` };
+  if (file.size > ATTACHMENTS.maxFileBytes) return { error: `“${shown}” is larger than 4 MB.` };
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let type = null;
+  if (IMAGE_TYPES[ext]) {
+    if (imageType(bytes) === IMAGE_TYPES[ext]) type = IMAGE_TYPES[ext];
+  } else if (TEXT_EXTENSIONS.has(ext) && !bytes.includes(0)) {
+    try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); type = "text/plain"; } catch {}
+  }
+  if (!type) return { error: `“${shown}” isn’t a supported screenshot (PNG, JPEG, WebP) or text log.` };
+  const base = original.replace(/\.[^.]*$/, "").replace(/[^A-Za-z0-9 ._-]+/g, "-").replace(/\s+/g, " ").trim().slice(0, 60) || "attachment";
+  return { file: { name: `${base}.${ext}`, type, size: bytes.length, sha256: await sha256Bytes(bytes), bytes } };
+}
+
+function imageType(b) {
+  const at = (offset, ...values) => values.every((v, i) => b[offset + i] === v);
+  if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+  if (at(0, 0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
+  return null;
+}
+
+function base64(bytes) {
+  if (typeof bytes.toBase64 === "function") return bytes.toBase64();
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+// Sends the report (and any attachments) to the Google Apps Script web app
+// (apps-script/Code.gs), which saves files to Drive, adds a Sheet row and emails
+// it. Does nothing until both secrets are set. Returns the script's reply.
+async function forwardToSheet(report, env, attachments = []) {
+  if (!env.SHEETS_WEBHOOK_URL || !env.SHEETS_WEBHOOK_TOKEN) return { ok: false, error: "not configured" };
   try {
+    const files = attachments.map((a) => ({ name: a.name, type: a.type, size: a.size, data: base64(a.bytes) }));
     const res = await fetch(env.SHEETS_WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: env.SHEETS_WEBHOOK_TOKEN, report }),
+      body: JSON.stringify({ token: env.SHEETS_WEBHOOK_TOKEN, report, attachments: files }),
     });
     const reply = await res.json().catch(() => ({}));
     if (!reply.ok) console.log("sheet forward rejected", report.id, res.status, reply.error || "");
+    return reply;
   } catch (err) {
     console.log("sheet forward failed", report.id, String(err));
+    return { ok: false, error: String(err) };
   }
 }
 
@@ -216,6 +288,11 @@ async function verifyTurnstile(token, ip, env) {
   } catch {
     return { ok: false, code: "siteverify-unreachable" };
   }
+}
+
+async function sha256Bytes(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function sha256(text) {
